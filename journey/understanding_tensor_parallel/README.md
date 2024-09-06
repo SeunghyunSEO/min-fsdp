@@ -1,9 +1,13 @@
 # References
 
-- [(Paper) Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053)
-- [pytorch.org/tutorials/intermediate/TP_tutorial.html](https://pytorch.org/tutorials/intermediate/TP_tutorial.html)
-- [lightning.ai/docs/pytorch/stable/advanced/model_parallel/tp.html](https://lightning.ai/docs/pytorch/stable/advanced/model_parallel/tp.html)
-- [pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py](https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py)
+- Papers
+        - [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053)
+        - [Reducing Activation Recomputation in Large Transformer Models](https://arxiv.org/abs/2205.05198)
+- Others
+        - [pytorch.org/tutorials/intermediate/TP_tutorial.html](https://pytorch.org/tutorials/intermediate/TP_tutorial.html)
+        - [lightning.ai/docs/pytorch/stable/advanced/model_parallel/tp.html](https://lightning.ai/docs/pytorch/stable/advanced/model_parallel/tp.html)
+        - [pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py](https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py)
+
 
 # Goal
 
@@ -21,7 +25,7 @@
 
 - w/o TP
 
-```
+```bash
 export MASTER_ADDR=node0 &&\
 export MASTER_PORT=23458 &&\
 torchrun --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
@@ -77,7 +81,7 @@ model: DummyModel(
 
 - w/ TP
 
-```
+```bash
 export LOCAL_RANK=1 &&\
 export WORLD_SIZE=2 &&\
 export MASTER_ADDR=node0 &&\
@@ -143,7 +147,7 @@ model: DummyModel(
 
 - w/o TP
 
-```
+```bash
 export MASTER_ADDR=node0 &&\
 export MASTER_PORT=23458 &&\
 torchrun --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
@@ -175,7 +179,7 @@ rank: 0, world size: 1
 
 - w/ TP
 
-```
+```bash
 export LOCAL_RANK=1 &&\
 export WORLD_SIZE=2 &&\
 export MASTER_ADDR=node0 &&\
@@ -216,14 +220,14 @@ rank: 0, world size: 2
 --use_torch_profiler
 ```
 
-```
+```bash
 export MASTER_ADDR=node0 &&\
 export MASTER_PORT=23458 &&\
 torchrun --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
 1_transformer_tensor_parallel.py --use_torch_profiler --hidden=2048
 ```
 
-```
+```bash
 export LOCAL_RANK=1 &&\
 export WORLD_SIZE=2 &&\
 export MASTER_ADDR=node0 &&\
@@ -242,5 +246,96 @@ torchrun --nproc_per_node=$WORLD_SIZE --master_addr=$MASTER_ADDR --master_port=$
 ![TP_torch_profiler_fig2](./assets/images/TP_torch_profiler_fig2.png)
 
 
-### Applying Vocab Parallel
+### Applying Vocab (Loss) Parallel
 
+```bash
+export MASTER_ADDR=node0 &&\
+export MASTER_PORT=23458 &&\
+torchrun --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+1_transformer_tensor_parallel.py --batch_size 2 --seq_len 64
+```
+
+```python
+        iter: 1
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 11.045799255371094
+        
+
+        iter: 2
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 8.317410469055176
+        
+
+        iter: 3
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 6.485448837280273
+        
+
+        iter: 4
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 4.934126377105713
+        
+
+        iter: 5
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 3.495692729949951
+```
+
+
+```bash
+export MASTER_ADDR=node0 &&\
+export MASTER_PORT=23458 &&\
+torchrun --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+1_transformer_tensor_parallel.py --batch_size 2 --seq_len 64 --loss_parallel
+```
+
+```python
+        iter: 1
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 11.04580020904541
+        
+
+        iter: 2
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 8.317468643188477
+        
+
+        iter: 3
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 6.485439300537109
+        
+
+        iter: 4
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 4.934161186218262
+        
+
+        iter: 5
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 3.4957220554351807
+```
+
+```bash
+export LOCAL_RANK=1 &&\
+export WORLD_SIZE=2 &&\
+export MASTER_ADDR=node0 &&\
+export MASTER_PORT=23458 &&\
+torchrun --nproc_per_node=$WORLD_SIZE --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+1_transformer_tensor_parallel.py --TP --loss_parallel --batch_size 2 --seq_len 64
+```
+
+- there is a bug lol
+
+```python
+
+```

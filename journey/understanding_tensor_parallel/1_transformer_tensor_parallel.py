@@ -1,7 +1,3 @@
-'''
-https://github.com/karpathy/nanoGPT/blob/master/model.py
-'''
-
 import os
 import math
 import random
@@ -16,6 +12,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from torch_profiler_utils import ContextManagers, get_torch_profiler
+
+from pdb import set_trace as Tra
 
 
 def set_seed(seed=1234):
@@ -35,6 +33,10 @@ def print_message_with_master_process(rank, message):
     if rank==0:
         print(message)
 
+'''
+adapted from karpathy
+https://github.com/karpathy/nanoGPT/blob/master/model.py
+'''
 class Attention(nn.Module):
     def __init__(self, hidden, nhead, bias=False):
         super(Attention, self).__init__()
@@ -93,46 +95,43 @@ class Transformer(nn.Module):
         self.nhead = nhead
         self.model = nn.ModuleDict(
             dict(
-                wte = nn.Embedding(vocab_size, hidden),
+                wte = nn.Embedding(vocab_size, hidden), # long tensor -> 3d tensor -> channel dim 쪼개
                 wpe = nn.Embedding(block_size, hidden),
                 h = nn.ModuleList([ResidualBlock(hidden, nhead, bias) for _ in range(nlayer)]),
                 ln = LayerNorm(hidden, bias=bias),
             )
         )
         self.lm_head = nn.Linear(hidden, vocab_size, bias=bias)
-        self.model.wte.weight = self.lm_head.weight
+        # self.model.wte.weight = self.lm_head.weight # for pure megatron implementation, we automatically tie embedding 
 
-    def compute_loss(self, z, y):
-        z = z[..., :-1, :].contiguous()
-        y = y[..., 1:].contiguous()
-        return F.cross_entropy(z.view(-1, self.vocab_size), y.view(-1))
+    def compute_loss(self, z, y, ignore_index=-100, reduction='mean'):
+        return F.cross_entropy(z, y, ignore_index=ignore_index, reduction=reduction)
 
-    def forward(self, x): 
-        y = x
+    def forward(self, x, y): 
         B, T = x.size()
-
         pos = torch.arange(0, T, dtype=torch.long, device=x.device)
         x = self.model.wte(x) + self.model.wpe(pos)
         for block in self.model.h:
             x = block(x)
         x = self.model.ln(x)
-
-        z = self.lm_head(x).float() # upcasted logit
-        return compute_loss(z, y)
+        z = self.lm_head(x).float() # projection to logit space and upcast
+        z = z[..., :-1, :].contiguous().view(B*(T-1), -1) # B*T, C
+        y = y.view(-1) # B*T, 1
+        return self.compute_loss(z, y), z
 
 class g(torch.autograd.Function):
     def forward(ctx, x):
         dist.all_reduce(x, op=dist.ReduceOp.SUM)
         return x
-    def backward(ctx, gradient):
-        return gradient
+    def backward(ctx, dx):
+        return dx
 
 class f(torch.autograd.Function):
     def forward(ctx, x):
         return x
-    def backward(ctx, gradient):
-        dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
-        return gradient
+    def backward(ctx, dx):
+        dist.all_reduce(dx, op=dist.ReduceOp.SUM)
+        return dx
 
 def rowwise_forward(self, x):
     bias = self.bias if self.bias else None
@@ -144,21 +143,84 @@ def colwise_forward(self, x):
     x = f.apply(x)
     return F.linear(x, self.weight, bias)
 
-class LossParallel(torch.autograd.Function):
-    '''
-    it's not exactly same vocab parallel from megatron
+'''
+it's not exactly same vocab parallel from megatron
+https://github.com/NVIDIA/Megatron-LM/blob/2d487b1871ba64ef1625781ea05715af1bc0d8ee/megatron/core/tensor_parallel/cross_entropy.py#L121-L126
+https://github.com/NVIDIA/Megatron-LM/blob/e8f8e63f13a074f7e35d72c8bfb3e1168cd84e8e/megatron/core/tensor_parallel/layers.py#L151
+https://github.com/pytorch/pytorch/blob/5ed3b70d09a4ab2a5be4becfda9dd0d3e3227c39/torch/distributed/tensor/parallel/loss.py#L126
+https://github.com/pytorch/pytorch/blob/41e653456e4a96b43ea96c9cd3cddc63ea74711d/torch/ao/nn/qat/modules/embedding_ops.py#L11
+https://github.com/mgmalek/efficient_cross_entropy/blob/main/modules.py
+'''
 
-    https://github.com/NVIDIA/Megatron-LM/blob/e8f8e63f13a074f7e35d72c8bfb3e1168cd84e8e/megatron/core/models/common/embeddings/language_model_embedding.py#L48
-    https://github.com/NVIDIA/Megatron-LM/blob/e8f8e63f13a074f7e35d72c8bfb3e1168cd84e8e/megatron/core/models/gpt/gpt_model.py#L124
-    https://github.com/NVIDIA/Megatron-LM/blob/e8f8e63f13a074f7e35d72c8bfb3e1168cd84e8e/megatron/core/models/gpt/gpt_model.py#L213-L237
-    https://github.com/NVIDIA/Megatron-LM/blob/e8f8e63f13a074f7e35d72c8bfb3e1168cd84e8e/megatron/core/tensor_parallel/layers.py#L649
-    '''
-    def forward(ctx, x):
-        raise NotImplementedError
+def get_mask_and_masked_input(x, vocab_start_index, vocab_end_index):
+    x_mask = (x < vocab_start_index) | (x >= vocab_end_index)
+    x = x.clone() - vocab_start_index
+    x[x_mask] = 0
+    return x, x_mask
+
+class LossParallel_:
+    def get_logit_max(z):
+        return torch.max(z.float(), dim=-1)[0]
+
+    def get_exp(z, z_max):
+        z -= z_max.unsqueeze(dim=-1)
+        exp = torch.exp(z) # B*T, C
+        sum_exp = torch.sum(exp, dim=-1, keepdim=True) # B*T, 1
+        return z, exp, sum_exp
+
+    def get_one_hot(y, z, vocab_start_index, vocab_end_index):
+        y, y_mask = get_mask_and_masked_input(y, vocab_start_index, vocab_end_index)
+        y = F.one_hot(y, num_classes=z.size(1))
+        y.masked_fill_(y_mask.unsqueeze(-1), 0.0)
+        return y
+
+    def get_nll_loss(z, y, exp, sum_exp, y_one_hot, ignore_index, reduction):
+        # compute loss using log sum exponential trick # https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/
+        log_sum_exp = torch.log(sum_exp) # normalizer
+        gt_z = torch.sum(z * y_one_hot, dim=1)
+
+        # Compute the loss
+        divisor = 1 if reduction == 'sum' else (y!=ignore_index).sum()
+        loss = (log_sum_exp.squeeze(1) - gt_z) / divisor
+        loss = torch.where(y == ignore_index, torch.tensor(0.0, device=z.device), loss) # token-level loss
+        loss = loss.sum()
+        return loss, divisor
+
+class LossParallel(torch.autograd.Function):
+    def forward(ctx, z, y, vocab_start_index, vocab_end_index, ignore_index=-100, reduction='mean'):
+
+        # communicate max logit value for numerical stability
+        z_max = LossParallel_.get_logit_max(z) # B*T, C
+        dist.all_reduce(z_max, op=dist.ReduceOp.MAX) # max
+
+        # get numerical stable exponentiated vectors
+        z, exp_z, sum_exp_z = LossParallel_.get_exp(z, z_max)
+        dist.all_reduce(sum_exp_z, op=dist.ReduceOp.SUM)
+
+        # compute loss and reduce all
+        y_one_hot = LossParallel_.get_one_hot(y, z, vocab_start_index, vocab_end_index)
+        loss, divisor = LossParallel_.get_nll_loss(z, y, exp_z, sum_exp_z, y_one_hot, ignore_index, reduction)
+        dist.all_reduce(loss, op=dist.ReduceOp.SUM) # mean and sum loss
+
+        # store results for backward
+        ctx.save_for_backward(exp_z.div_(sum_exp_z), y_one_hot, divisor)
+        return loss
+
     def backward(ctx, grad_output):
-        raise NotImplementedError
+        y_hat, y_one_hot, divisor = ctx.saved_tensors
+        dz = y_hat - y_one_hot # logit gradient 
+        dz /= divisor # dL/dLogit
+        dz *= grad_output # 1.0 because it's end 
+        return dz, None, None, None, None, None # No gradients needed for y, ignore_index, or reduction parameters
+
+def embedding_parallel(self, x):
+    x, x_mask = get_mask_and_masked_input(x, self.vocab_start_index, self.vocab_end_index)
+    x = F.embedding(x, self.weight)
+    x.masked_fill_(x_mask.unsqueeze(-1), 0.0)
+    return g.apply(x) # because readout layer is col-wise, embedding layer is row-wise
 
 def parallelize_module(
+    args,
     model: nn.Module, 
     world_size: int, 
     rank: int, 
@@ -169,8 +231,12 @@ def parallelize_module(
 
     for name, module in model.named_children():
         if isinstance(module, nn.Module):
-            parallelize_module(module, world_size, rank)
+            parallelize_module(args, module, world_size, rank)
 
+        '''
+        pytorch impl matmul with transposed weight matrix,
+        so you should slice weight matrix counter-intuitively. 
+        '''
         for _ in rowwise_list:
             if _ in name.lower():
                 assert module.weight.size(1) % world_size == 0 
@@ -183,6 +249,43 @@ def parallelize_module(
                 chunk_size = module.weight.size(0)//world_size
                 module.weight.data = module.weight.data[chunk_size*rank: chunk_size*(rank+1), :].contiguous()
                 module.forward = colwise_forward.__get__(module)
+
+        '''
+        you should slice embedding weight matrix col-wise (vocab dimension),
+        so you need to perform softmax operation across sliced vocab dim.
+        and because original megatron paper tie embedding and unembedding matrices, you should care this too.
+        '''
+        if args.loss_parallel:
+            if 'lm_head' in name.lower() or 'wte' in name.lower():
+                chunk_size = module.weight.size(0)//world_size
+                vocab_start_index = chunk_size*rank
+                vocab_end_index = chunk_size*(rank+1)
+
+                if 'lm_head' in name.lower():
+                    module.weight.data = module.weight.data[vocab_start_index: vocab_end_index, :].contiguous()
+                    module.forward = colwise_forward.__get__(module)
+                    def loss_parallel(x, y, ignore_index=-100, reduction='mean'):
+                        return LossParallel.apply(x, y, vocab_start_index, vocab_end_index, ignore_index, reduction)
+                    model.compute_loss = loss_parallel
+
+                # elif 'wte' in name.lower():
+                #     module.vocab_start_index = vocab_start_index
+                #     module.vocab_end_index = vocab_end_index
+                #     module.forward = embedding_parallel.__get__(module)
+
+def get_dummy_input(
+    vocab_size,
+    device,
+    batch_size=256,
+    seq_len=1024,
+):
+    num_pad_tokens = seq_len//10
+    input_ids = torch.randint(vocab_size, (batch_size, seq_len))
+    labels = torch.cat((input_ids[:, 1:seq_len-num_pad_tokens], torch.full((batch_size, num_pad_tokens), -100)),1)
+    return {
+        'input_ids': input_ids.to(device),
+        'labels': labels.to(device),
+    }
 
 def main(args):
     rank, world_size = init_dist()
@@ -198,12 +301,21 @@ def main(args):
     model = Transformer(vocab_size, block_size, hidden, nhead, nlayer).to(device).train()
     if args.TP:
         assert model.nhead % world_size == 0, "nhead should be divisible by TP degree"
-        parallelize_module(model, world_size, rank)
+        parallelize_module(args, model, world_size, rank)
+    else:
+        if args.loss_parallel:
+            def loss_parallel(x, y, ignore_index=-100, reduction='mean'):
+                return LossParallel.apply(x, y, 0, vocab_size, ignore_index, reduction)
+            model.compute_loss = loss_parallel
     lr = 0.01
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 
-    sent = "i love tensor parallelism."
-    input_ids = tokenizer(sent, return_tensors='pt').to(device)
+    if args.batch_size and args.seq_len:
+        input_ids = get_dummy_input(vocab_size, device, args.batch_size, args.seq_len)
+    else:
+        sent = "i love tensor parallelism."
+        input_ids = tokenizer(sent, return_tensors='pt').to(device)
+        input_ids['labels'] = input_ids['input_ids'][:, 1:]
 
     if args.use_torch_profiler:
         num_wait_steps, num_warmup_steps, num_active_steps, num_repeat = 1, 2, 3, 1
@@ -223,24 +335,35 @@ def main(args):
 
     with ContextManagers(context) as p:
         for iter in range(num_iter):
-            loss = model(input_ids['input_ids'])
+            loss, z = model(input_ids['input_ids'], input_ids['labels'])
+            z.retain_grad()
             loss.backward()
+
+            message = f'''
+            iter: {iter+1}
+            input size: {input_ids['input_ids'].size()}
+            num padding toekns: {(input_ids['labels'] == -100).sum()}
+            loss: {loss}
+            '''
+            # message += f'''
+            # z.grad: {z.grad}
+            # '''
+
             optimizer.step()
             optimizer.zero_grad()
 
-            ## print outputs
-            message = f'''
-            iter: {iter+1}
-            loss: {loss}
-            '''
             print_message_with_master_process(rank, message)
             if args.use_torch_profiler:
                 p.step()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument('--batch_size', default=None, type=int)
+    parser.add_argument('--seq_len', default=None, type=int)
+
     parser.add_argument('--hidden', default=256, type=int)
     parser.add_argument('--TP', action='store_true')
+    parser.add_argument('--loss_parallel', action='store_true')
     parser.add_argument('--use_torch_profiler', action='store_true')
     args, _ = parser.parse_known_args()
     main(args)
