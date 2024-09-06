@@ -13,8 +13,8 @@
 
 - [x] naive impl on MLP
 - [x] transformer (using Autograd)
-- [ ] vocab parallel (loss parallel)
-
+- [x] vocab parallel (loss parallel)
+- [ ] sequence parallel (TBC)
 
 # Examples (run scripts)
 
@@ -259,31 +259,31 @@ torchrun --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$MASTER_POR
         iter: 1
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 11.045799255371094
+        loss: 11.14531421661377
         
 
         iter: 2
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 8.317410469055176
+        loss: 7.8605475425720215
         
 
         iter: 3
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 6.485448837280273
+        loss: 6.055154800415039
         
 
         iter: 4
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 4.934126377105713
+        loss: 4.597280502319336
         
 
         iter: 5
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 3.495692729949951
+        loss: 3.266993761062622
 ```
 
 
@@ -298,31 +298,31 @@ torchrun --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$MASTER_POR
         iter: 1
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 11.04580020904541
+        loss: 11.145313262939453
         
 
         iter: 2
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 8.317468643188477
+        loss: 7.860340595245361
         
 
         iter: 3
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 6.485439300537109
+        loss: 6.054848670959473
         
 
         iter: 4
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 4.934161186218262
+        loss: 4.597006320953369
         
 
         iter: 5
         input size: torch.Size([2, 64])
         num padding toekns: 12
-        loss: 3.4957220554351807
+        loss: 3.2667441368103027
 ```
 
 ```bash
@@ -331,11 +331,67 @@ export WORLD_SIZE=2 &&\
 export MASTER_ADDR=node0 &&\
 export MASTER_PORT=23458 &&\
 torchrun --nproc_per_node=$WORLD_SIZE --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-1_transformer_tensor_parallel.py --TP --loss_parallel --batch_size 2 --seq_len 64
+1_transformer_tensor_parallel.py --batch_size 2 --seq_len 64 --loss_parallel --TP
 ```
 
 - there is a bug lol
 
 ```python
+        iter: 1
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 11.145294189453125
+        
 
+        iter: 2
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 7.860313415527344
+        
+
+        iter: 3
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 6.0548553466796875
+        
+
+        iter: 4
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 4.596996307373047
+        
+
+        iter: 5
+        input size: torch.Size([2, 64])
+        num padding toekns: 12
+        loss: 3.2667508125305176
 ```
+
+
+### Profling Final Results
+
+- batch_size: 256
+- sqe_len: 256
+- 1gpu baseline 2gpu TP
+
+```bash
+export LOCAL_RANK=1 &&\
+export WORLD_SIZE=2 &&\
+export MASTER_ADDR=node0 &&\
+export MASTER_PORT=23458 &&\
+torchrun --nproc_per_node=$WORLD_SIZE --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+1_transformer_tensor_parallel.py --batch_size 256 --seq_len 256 --use_torch_profiler
+```
+
+![hidden_256_batch_256_seq_len_256_baseline](./assets/images/hidden_256_batch_256_seq_len_256_baseline.png)
+
+```bash
+export LOCAL_RANK=1 &&\
+export WORLD_SIZE=2 &&\
+export MASTER_ADDR=node0 &&\
+export MASTER_PORT=23458 &&\
+torchrun --nproc_per_node=$WORLD_SIZE --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+1_transformer_tensor_parallel.py --batch_size 256 --seq_len 256 --loss_parallel --TP --use_torch_profiler
+```
+
+![hidden_256_batch_256_seq_len_256_TP_2gpu](./assets/images/hidden_256_batch_256_seq_len_256_TP_2gpu.png)

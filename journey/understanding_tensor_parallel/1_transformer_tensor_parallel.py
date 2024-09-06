@@ -102,7 +102,7 @@ class Transformer(nn.Module):
             )
         )
         self.lm_head = nn.Linear(hidden, vocab_size, bias=bias)
-        # self.model.wte.weight = self.lm_head.weight # for pure megatron implementation, we automatically tie embedding 
+        self.model.wte.weight = self.lm_head.weight # for pure megatron implementation, we automatically tie embedding 
 
     def compute_loss(self, z, y, ignore_index=-100, reduction='mean'):
         return F.cross_entropy(z, y, ignore_index=ignore_index, reduction=reduction)
@@ -144,7 +144,7 @@ def colwise_forward(self, x):
     return F.linear(x, self.weight, bias)
 
 '''
-it's not exactly same vocab parallel from megatron
+Refrences for vocab parallel (but it's not exactly same)
 https://github.com/NVIDIA/Megatron-LM/blob/2d487b1871ba64ef1625781ea05715af1bc0d8ee/megatron/core/tensor_parallel/cross_entropy.py#L121-L126
 https://github.com/NVIDIA/Megatron-LM/blob/e8f8e63f13a074f7e35d72c8bfb3e1168cd84e8e/megatron/core/tensor_parallel/layers.py#L151
 https://github.com/pytorch/pytorch/blob/5ed3b70d09a4ab2a5be4becfda9dd0d3e3227c39/torch/distributed/tensor/parallel/loss.py#L126
@@ -172,11 +172,12 @@ class LossParallel_:
         y, y_mask = get_mask_and_masked_input(y, vocab_start_index, vocab_end_index)
         y = F.one_hot(y, num_classes=z.size(1))
         y.masked_fill_(y_mask.unsqueeze(-1), 0.0)
-        return y
+        return y, y_mask
 
-    def get_nll_loss(z, y, exp, sum_exp, y_one_hot, ignore_index, reduction):
+    def get_nll_loss(z, y, exp, sum_exp, y_one_hot, y_mask, ignore_index, reduction):
         # compute loss using log sum exponential trick # https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/
         log_sum_exp = torch.log(sum_exp) # normalizer
+        log_sum_exp.masked_fill_(y_mask.unsqueeze(-1), 0.0)
         gt_z = torch.sum(z * y_one_hot, dim=1)
 
         # Compute the loss
@@ -198,8 +199,8 @@ class LossParallel(torch.autograd.Function):
         dist.all_reduce(sum_exp_z, op=dist.ReduceOp.SUM)
 
         # compute loss and reduce all
-        y_one_hot = LossParallel_.get_one_hot(y, z, vocab_start_index, vocab_end_index)
-        loss, divisor = LossParallel_.get_nll_loss(z, y, exp_z, sum_exp_z, y_one_hot, ignore_index, reduction)
+        y_one_hot, y_mask = LossParallel_.get_one_hot(y, z, vocab_start_index, vocab_end_index)
+        loss, divisor = LossParallel_.get_nll_loss(z, y, exp_z, sum_exp_z, y_one_hot, y_mask, ignore_index, reduction)
         dist.all_reduce(loss, op=dist.ReduceOp.SUM) # mean and sum loss
 
         # store results for backward
@@ -257,21 +258,22 @@ def parallelize_module(
         '''
         if args.loss_parallel:
             if 'lm_head' in name.lower() or 'wte' in name.lower():
+                ## TODO: need vocab padding
                 chunk_size = module.weight.size(0)//world_size
                 vocab_start_index = chunk_size*rank
                 vocab_end_index = chunk_size*(rank+1)
 
                 if 'lm_head' in name.lower():
-                    module.weight.data = module.weight.data[vocab_start_index: vocab_end_index, :].contiguous()
+                    module.weight.data = module.weight.data[vocab_start_index:vocab_end_index, :].contiguous()
                     module.forward = colwise_forward.__get__(module)
                     def loss_parallel(x, y, ignore_index=-100, reduction='mean'):
                         return LossParallel.apply(x, y, vocab_start_index, vocab_end_index, ignore_index, reduction)
                     model.compute_loss = loss_parallel
 
-                # elif 'wte' in name.lower():
-                #     module.vocab_start_index = vocab_start_index
-                #     module.vocab_end_index = vocab_end_index
-                #     module.forward = embedding_parallel.__get__(module)
+                elif 'wte' in name.lower():
+                    module.vocab_start_index = vocab_start_index
+                    module.vocab_end_index = vocab_end_index
+                    module.forward = embedding_parallel.__get__(module)
 
 def get_dummy_input(
     vocab_size,
@@ -311,7 +313,7 @@ def main(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 
     if args.batch_size and args.seq_len:
-        input_ids = get_dummy_input(vocab_size, device, args.batch_size, args.seq_len)
+        input_ids = get_dummy_input(vocab_size-1, device, args.batch_size, args.seq_len)
     else:
         sent = "i love tensor parallelism."
         input_ids = tokenizer(sent, return_tensors='pt').to(device)
